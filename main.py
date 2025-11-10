@@ -9,7 +9,7 @@ from pathlib import Path
 
 from utils import set_for_logger
 from dataloaders import build_dataloader
-from loss import DiceLoss
+from loss import DiceLoss, JointLoss
 import torch.nn.functional as F
 from nets import build_model
 
@@ -22,20 +22,38 @@ from aggregator_mixed_sim import MixedSimAggregator
 def get_client_features(local_models, dataloaders, device):
     """
     从所有客户端的验证数据加载器中提取特征（假定使用 UNet_pro）。
+    --- 修改：现在提取 z 和 shadow ---
     """
     client_feats_list = []
     for model, loader in zip(local_models, dataloaders):
         model.eval()
         all_z = []
+        all_shadow_flat = [] # <--- 新增
+        
         try:
             for x, target in loader: # 迭代整个验证集
                 x = x.to(device)
                 # 假设是 UNet_pro，它返回 (output, z, shadow)
-                _, z, _ = model(x) 
+                _, z, shadow = model(x) # <--- 接收 shadow
+                
+                # --- 将 shadow 展平 ---
+                # shadow 的形状是 [B, C, H, W]，z 的形状是 [B, D]
+                # 我们用平均池化将其变为 [B, C]
+                shadow_flat = F.adaptive_avg_pool2d(shadow, (1, 1)).view(shadow.shape[0], -1)
+                # --- 展平结束 ---
+                
                 all_z.append(z.cpu())
+                all_shadow_flat.append(shadow_flat.cpu()) # <--- 存储
             
             if len(all_z) > 0:
-                client_feats_list.append(torch.cat(all_z, dim=0))
+                client_z = torch.cat(all_z, dim=0)
+                client_shadow = torch.cat(all_shadow_flat, dim=0)
+                
+                # --- 关键：拼接特征 ---
+                combined_features = torch.cat([client_z, client_shadow], dim=1)
+                client_feats_list.append(combined_features)
+                # --- 拼接结束 ---
+                
             else:
                 logging.warning(f"一个客户端的验证加载器为空。")
                 client_feats_list.append(torch.empty(0, 1)) # 添加一个带无效维度的空张量
@@ -69,18 +87,14 @@ def get_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--seed', type=int, default=0, help="Random seed")
-    
-    # --- 修改 1: 更新默认 data_root 路径为占位符 ---
     parser.add_argument('--data_root', type=str, required=False, 
                         default="E:/A_Study_Materials/Dataset/Prostate", 
                         help="Data directory (指向 fundus 或 prostate 的 .npy 文件夹)")
-    
-    # --- 修改 2: 更新 dataset 帮助文本 ---
     parser.add_argument('--dataset', type=str, default='prostate', 
                         help="Dataset type: 'fundus' (4 站点) 或 'prostate' (6 站点)")
     
-    # 强制使用 unet_pro，因为 InfoGeo sim 需要 z 特征
-    parser.add_argument('--model', type=str, default='unet_pro', help='Model type (unet or unet_pro). InfoGeo sim requires unet_pro.')
+    # 强制使用 unet_pro，因为两种方法都需要 z 特征
+    parser.add_argument('--model', type=str, default='unet_pro', help='Model type (unet or unet_pro). Required by MI-Sim and UFT.')
 
     parser.add_argument('--rounds', type=int, default=200, help='number of maximum communication round')
     parser.add_argument('--epochs', type=int, default=1, help='number of local epochs')
@@ -92,23 +106,25 @@ def get_args():
     parser.add_argument('--lr', type=float, default=1e-3, help='learning rate (default: 0.1)')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help="L2 regularization strength")
     parser.add_argument('--batch-size', type=int, default=8, help='input batch size for training (default: 64)')
-    parser.add_argument('--experiment', type=str, default='experiment_infogeo-2', help='Experiment name')
+    parser.add_argument('--experiment', type=str, default='experiment_mi_uft', help='Experiment name')
 
     parser.add_argument('--test_step', type=int, default=1)
     
-    # train_ratio 在 fundus (RIF) 加载器中用于 8:2 划分，但在新的 Prostate 加载器中被忽略 (其内部使用 6:2:2)
-    # parser.add_argument('--train_ratio', type=float, default=0.6, help="Ratio for train/val split in RIF dataloader (ignored by Prostate dataloader)")
-    
-    # 添加 InfoGeoMixer 的参数
+    # --- FedIGMS (MI-Sim) 参数 ---
     parser.add_argument('--rad_gamma', type=float, default=1.0, help='Gamma for RAD similarity')
     parser.add_argument('--mine_hidden', type=int, default=128, help='Hidden layer size for MINE estimator')
     parser.add_argument('--lr_mine', type=float, default=1e-3, help='Learning rate for MINE estimator')
     parser.add_argument('--alpha_init', type=float, default=0.5, help='Initial alpha value for mixed similarity')
+    
+    # --- FedU (UFT) 参数 ---
+    parser.add_argument('--lambda_uft', type=float, default=0.1, 
+                        help='Weight for the UFT regularizer (lambda_2 in paper)')
+    parser.add_argument('--uft_beta_u', type=float, default=1.0, 
+                        help='Uncertainty tax coefficient (beta_u) for UFT')
+
+    # --- 组合算法参数 ---
     parser.add_argument('--sim_start_round', type=int, default=5, help='Round to start using similarity aggregation')
-
     parser.add_argument('--dropout_rate', type=float, default=0.2, help='Dropout rate for the model')
-
-
 
     args = parser.parse_args()
     return args
@@ -182,6 +198,9 @@ def test(model, dataloader, device, loss_func):
     loss = loss_all / len(dataloader)
     return loss, acc
 
+def _flat_params(model):
+    return torch.cat([p.data.float().view(-1).cpu() for p in model.parameters()])
+
 def main(args):
     set_for_logger(args)
     logging.info(args)
@@ -218,12 +237,18 @@ def main(args):
     # (初始化 InfoGeo Aggregator)
     try:
         dummy_input = torch.randn(2, 3, 384, 384).to(device) # 假设输入 384x384
-        _, z_dummy, _ = global_model(dummy_input)
-        feat_dim = z_dummy.shape[1]
-        logging.info(f"Detected feature dimension (feat_dim) = {feat_dim}")
+        
+        # --- 修改：推断新的 feat_dim ---
+        _, z_dummy, shadow_dummy = global_model(dummy_input)
+        shadow_dummy_flat = F.adaptive_avg_pool2d(shadow_dummy, (1, 1)).view(shadow_dummy.shape[0], -1)
+        feat_dim = z_dummy.shape[1] + shadow_dummy_flat.shape[1] # 拼接后的维度
+        
+        logging.info(f"Detected feature dimension (z + shadow_flat) = {feat_dim}")
+        # --- 修改结束 ---
+        
     except Exception as e:
         logging.error(f"Could not determine feature dimension: {e}")
-        feat_dim = 2048 
+        feat_dim = 2048 + 512 # (z_dim + shadow_dim) 假设值
         logging.warning(f"Failed to infer feat_dim, defaulting to {feat_dim}")
 
     aggregator = MixedSimAggregator(
@@ -238,7 +263,9 @@ def main(args):
     logging.info(f"InfoGeoAggregator initialized. Start alpha = {args.alpha_init}")
 
     # (Loss 和 Optimizer)
-    loss_fun = DiceLoss()
+    # --- 修改：使用 JointLoss ---
+    loss_fun = JointLoss() 
+    
     optimizer = []
     for id in range(len(clients)):
         optimizer.append(torch.optim.Adam(local_models[id].parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99)))
@@ -247,7 +274,9 @@ def main(args):
     best_dice = 0
     best_dice_round = 0
     best_local_dice = []
-    last_avg_dice_tensor = None 
+    
+    # --- (保留) 为验证集反馈添加状态变量 ---
+    last_avg_val_dice_tensor = None 
 
     weight_save_dir = os.path.join(args.save_dir, args.experiment)
     Path(weight_save_dir).mkdir(parents=True, exist_ok=True)
@@ -270,7 +299,8 @@ def main(args):
         if r >= args.sim_start_round:
             logging.info('Calculating Info-Geometry Mixed Similarity...')
             # 3a. 提取特征 (使用验证集)
-            client_feats = get_client_features(temp_locals, val_dls, device)
+            # --- (已修改) get_client_features 现在返回拼接特征 ---
+            client_feats = get_client_features(temp_locals, val_dls, device) 
             
             if client_feats is None:
                 logging.warning("Feature extraction failed. Falling back to FedAvg.")
@@ -278,8 +308,9 @@ def main(args):
             else:
                 # 3b. 计算相似度和权重
                 S_mix, S_rad, S_mi, current_alpha = aggregator.compute_similarity_matrix(client_feats)
-                logging.info(f'Current Alpha: {current_alpha:.4f}')
+                logging.info(f'Current Alpha: {current_alpha:.4f}')                        
                 aggr_weights = aggregator.weights_from_similarity(S_mix).to(device)
+                
                 logging.info(f'Aggregator Weights: {aggr_weights.cpu().numpy()}')
                 
                 if len(aggr_weights) != len(temp_locals):
@@ -301,7 +332,7 @@ def main(args):
 
 
         if r % args.test_step == 0:
-            # 5. 测试 (使用测试集)
+            # 5. 测试 (使用测试集 - 用于最终报告和保存最佳模型)
             avg_loss = []
             avg_dice = []
             for idx, client in enumerate(clients):
@@ -313,24 +344,36 @@ def main(args):
 
             avg_dice_v = sum(avg_dice) / len(avg_dice) if len(avg_dice) > 0 else 0
             avg_loss_v = sum(avg_loss) / len(avg_loss) if len(avg_loss) > 0 else 0
-            current_avg_dice_tensor = torch.tensor(avg_dice, device=device, dtype=torch.float32)
-
+            
             logging.info('Round: [%d]  avg_test_loss: %f avg_test_acc: %f std_test_acc: %f'%(r, avg_loss_v, avg_dice_v, np.std(np.array(avg_dice))))
 
-            # 6. 更新 Alpha (使用测试集性能提升)
+            # --- (保留) 在验证集上进行评估以获取反馈 ---
+            avg_val_dice = []
+            for idx, client in enumerate(clients):
+                _, val_dice = test(local_models[idx], val_dls[idx], device, loss_fun)
+                avg_val_dice.append(val_dice)
+            
+            current_avg_val_dice_tensor = torch.tensor(avg_val_dice, device=device, dtype=torch.float32)
+            logging.info('Round: [%d]  avg_val_acc (for feedback): %f'%(r, current_avg_val_dice_tensor.mean().item()))
+            # --- (保留) 结束 ---
+
+
+            # 6. 更新 Alpha (使用验证集性能提升)
             if r >= args.sim_start_round and S_mix is not None:
-                if last_avg_dice_tensor is not None:
+                # --- (保留) 使用 last_avg_val_dice_tensor ---
+                if last_avg_val_dice_tensor is not None: 
                     try:
-                        val_improve = current_avg_dice_tensor - last_avg_dice_tensor
-                        logging.info(f"Updating alpha with feedback. Improvement: {val_improve.cpu().numpy()}")
+                        val_improve = current_avg_val_dice_tensor - last_avg_val_dice_tensor 
+                        logging.info(f"Updating alpha with VALIDATION feedback. Improvement: {val_improve.cpu().numpy()}")
                         sig_rad, sig_mi, new_alpha = aggregator.update_alpha_from_feedback(S_rad, S_mi, val_improve)
                         logging.info(f'Alpha update: sig_rad={sig_rad:.4f}, sig_mi={sig_mi:.4f}, new_alpha={new_alpha:.4f}')
                     except Exception as e:
                         logging.warning(f"Could not update alpha: {e}")
                 
-            last_avg_dice_tensor = current_avg_dice_tensor
+            last_avg_val_dice_tensor = current_avg_val_dice_tensor
+            # --- (保留) 结束 ---
 
-            # 7. 保存最佳模型
+            # 7. 保存最佳模型 (仍然基于测试集性能 avg_dice_v)
             if best_dice < avg_dice_v:
                 best_dice = avg_dice_v
                 best_dice_round = r
